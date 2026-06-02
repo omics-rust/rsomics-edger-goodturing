@@ -1,0 +1,30 @@
+[package]
+name = "rsomics-edger-goodturing"
+version = "0.1.0"
+description = "Simple Good-Turing frequency smoothing of count vectors/matrices into proportion estimates (incl. unseen-item mass) — Rust port of edgeR goodTuring/goodTuringProportions"
+edition = "2024"
+rust-version = "1.91"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/omics-rust/rsomics-edger-goodturing"
+authors = ["Zane Leong <efd@live.com>"]
+
+[[bin]]
+name = "rsomics-edger-goodturing"
+path = "src/main.rs"
+
+[lib]
+name = "rsomics_edger_goodturing"
+path = "src/lib.rs"
+doctest = false
+
+[dependencies]
+rsomics-common = { version = "0.6" }
+rsomics-help = { version = "0.3" }
+clap = { version = "4", features = ["derive"] }
+
+[dev-dependencies]
+criterion = { version = "0.7", default-features = false, features = ["cargo_bench_support"] }
+
+[[bench]]
+name = "bench"
+harness = false

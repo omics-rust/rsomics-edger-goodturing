@@ -88,20 +88,46 @@ pub fn good_turing(x: &[i64], conf: f64) -> GoodTuring {
         }
     }
 
-    let mut tab = vec![0i64; (max_x + 1) as usize];
-    for &v in x {
-        tab[v as usize] += 1;
-    }
-    let n0 = tab[0];
-
-    let mut count = Vec::new();
-    let mut nr = Vec::new();
-    for (r, &c) in tab.iter().enumerate().skip(1) {
-        if c > 0 {
-            count.push(r as i64);
-            nr.push(c);
+    // edgeR picks the tabulation strategy by max(x) vs length(x): a dense
+    // frequency table costs O(max_x), so when a single count dwarfs the vector
+    // (e.g. a 1e10 library size) it would allocate gigabytes. In that regime we
+    // instead collect frequency-of-frequencies from the sorted distinct counts,
+    // which costs O(n log n) in the vector length. Both paths yield identical
+    // (r, N_r) pairs, so the downstream math is unchanged.
+    let (n0, count, nr) = if max_x < x.len() as i64 {
+        let mut tab = vec![0i64; (max_x + 1) as usize];
+        for &v in x {
+            tab[v as usize] += 1;
         }
-    }
+        let mut count = Vec::new();
+        let mut nr = Vec::new();
+        for (r, &c) in tab.iter().enumerate().skip(1) {
+            if c > 0 {
+                count.push(r as i64);
+                nr.push(c);
+            }
+        }
+        (tab[0], count, nr)
+    } else {
+        let mut sorted: Vec<i64> = x.to_vec();
+        sorted.sort_unstable();
+        let mut n0 = 0i64;
+        let mut count = Vec::new();
+        let mut nr = Vec::new();
+        for &v in &sorted {
+            if v == 0 {
+                n0 += 1;
+                continue;
+            }
+            if count.last() == Some(&v) {
+                *nr.last_mut().unwrap() += 1;
+            } else {
+                count.push(v);
+                nr.push(1);
+            }
+        }
+        (n0, count, nr)
+    };
 
     let proportion = simple_good_turing(&count, &nr, conf);
     let total: i64 = count.iter().zip(&nr).map(|(&r, &n)| r * n).sum();
@@ -356,5 +382,106 @@ mod tests {
         assert_eq!(gt.n0, 3);
         assert_eq!(gt.count, [1, 2, 3]);
         assert!((gt.p0 - 0.285714285714).abs() < 1e-9);
+    }
+
+    // Reference (r, N_r) tabulation independent of the max-vs-length branch,
+    // so both the dense and sorted-unique paths can be checked against it.
+    fn ref_tally(x: &[i64]) -> (i64, Vec<i64>, Vec<i64>) {
+        use std::collections::BTreeMap;
+        let mut m: BTreeMap<i64, i64> = BTreeMap::new();
+        for &v in x {
+            *m.entry(v).or_insert(0) += 1;
+        }
+        let n0 = m.remove(&0).unwrap_or(0);
+        let (count, nr) = m.into_iter().unzip();
+        (n0, count, nr)
+    }
+
+    // The dense tabulate (max_x < n) and the sorted-unique collector
+    // (max_x >= n) must yield byte-identical (r, N_r) pairs; only the
+    // collection strategy differs.
+    #[test]
+    fn both_tabulation_paths_agree() {
+        // Dense path: max 3 < len 6.
+        let dense = [1i64, 1, 2, 3, 3, 3];
+        let gt = good_turing(&dense, 1.96);
+        let (n0, count, nr) = ref_tally(&dense);
+        assert_eq!(gt.n0, n0);
+        assert_eq!(gt.count, count);
+        assert_eq!(gt.n, nr);
+
+        // Sorted path: max 2e9 >= len 5.
+        let sparse = [2_000_000_000i64, 2_000_000_000, 1_000_000_000, 1, 2];
+        let gt = good_turing(&sparse, 1.96);
+        let (n0, count, nr) = ref_tally(&sparse);
+        assert_eq!(gt.n0, n0);
+        assert_eq!(gt.count, count);
+        assert_eq!(gt.n, nr);
+    }
+
+    // A dense table sized to max(x) would allocate O(max_x) i64 — a single
+    // ~2e9 count means ~16 GB and an OOM SIGKILL. The sorted-unique branch
+    // makes this input finish in microseconds with the correct, finite SGT
+    // result. Expected values are our i64-exact SGT output; edgeR reports
+    // P0 = 1.4183739e-9 here because its C core sums the total sample size
+    // (5_000_000_003) in a 32-bit int that wraps to 705_032_707 — a HELD
+    // divergence in the > 2^31 total regime, where our i64 stays correct.
+    #[test]
+    fn large_count_column_no_oom() {
+        let gt = good_turing(&[2_000_000_000, 2_000_000_000, 1_000_000_000, 1, 2], 1.96);
+        assert_eq!(gt.n0, 0);
+        assert_eq!(gt.count, [1, 2, 1_000_000_000, 2_000_000_000]);
+        assert_eq!(gt.n, [1, 1, 1, 2]);
+        assert_eq!(gt.p0, 1.0 / 5_000_000_003.0);
+        let expect = [
+            2.799_115_569_498_737e-10,
+            4.869_217_280_128_239e-10,
+            1.999_999_998_454_309_6e-1,
+            3.999_999_995_938_678_4e-1,
+        ];
+        for (got, want) in gt.proportion.iter().zip(&expect) {
+            assert!(
+                (got - want).abs() <= want.abs() * 1e-12,
+                "got {got} want {want}"
+            );
+        }
+        let mass: f64 =
+            gt.n.iter()
+                .zip(&gt.proportion)
+                .map(|(&n, &p)| n as f64 * p)
+                .sum();
+        assert!((mass - (1.0 - gt.p0)).abs() < 1e-15);
+    }
+
+    // A 1e10 count exceeds R's 32-bit integer domain entirely (as.integer(x)
+    // returns NA there), so edgeR cannot process it at all — but the dense
+    // table would try to allocate ~80 GB. The sorted-unique branch handles it
+    // exactly; values are self-consistent SGT (proportions renormalize to
+    // 1 - P0).
+    #[test]
+    fn count_beyond_r_int_domain_no_oom() {
+        let gt = good_turing(&[10_000_000_000, 5_000_000_000, 3, 1, 1], 1.96);
+        assert_eq!(gt.n0, 0);
+        assert_eq!(gt.count, [1, 3, 5_000_000_000, 10_000_000_000]);
+        assert_eq!(gt.n, [2, 1, 1, 1]);
+        assert_eq!(gt.p0, 2.0 / 15_000_000_005.0);
+        let expect = [
+            9.104_490_002_888_423e-11,
+            2.276_166_499_496_975_2e-10,
+            3.333_333_331_623_107_3e-1,
+            6.666_666_662_946_495e-1,
+        ];
+        for (got, want) in gt.proportion.iter().zip(&expect) {
+            assert!(
+                (got - want).abs() <= want.abs() * 1e-12,
+                "got {got} want {want}"
+            );
+        }
+        let mass: f64 =
+            gt.n.iter()
+                .zip(&gt.proportion)
+                .map(|(&n, &p)| n as f64 * p)
+                .sum();
+        assert!((mass - (1.0 - gt.p0)).abs() < 1e-15);
     }
 }
